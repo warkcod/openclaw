@@ -110,6 +110,206 @@ describe("buildFeishuAgentBody", () => {
   });
 });
 
+describe("handleFeishuMessage sender name resolution", () => {
+  const mockFinalizeInboundContext = vi.fn((ctx: unknown) => ctx);
+  const mockDispatchReplyFromConfig = vi
+    .fn()
+    .mockResolvedValue({ queuedFinal: false, counts: { final: 1 } });
+  const mockWithReplyDispatcher = vi.fn(
+    async ({
+      dispatcher,
+      run,
+      onSettled,
+    }: Parameters<PluginRuntime["channel"]["reply"]["withReplyDispatcher"]>[0]) => {
+      try {
+        return await run();
+      } finally {
+        dispatcher.markComplete();
+        try {
+          await dispatcher.waitForIdle();
+        } finally {
+          await onSettled?.();
+        }
+      }
+    },
+  );
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockGetMessageFeishu.mockReset().mockResolvedValue(null);
+    mockListFeishuThreadMessages.mockReset().mockResolvedValue([]);
+    mockReadSessionUpdatedAt.mockReturnValue(undefined);
+    mockResolveStorePath.mockReturnValue("/tmp/feishu-sessions.json");
+    mockResolveAgentRoute.mockReturnValue({
+      agentId: "main",
+      channel: "feishu",
+      accountId: "default",
+      sessionKey: "agent:main:feishu:dm:ou-sender",
+      mainSessionKey: "agent:main:main",
+      matchedBy: "default",
+    });
+    setFeishuRuntime(
+      createPluginRuntimeMock({
+        system: {
+          enqueueSystemEvent: vi.fn(),
+        },
+        channel: {
+          routing: {
+            resolveAgentRoute:
+              mockResolveAgentRoute as unknown as PluginRuntime["channel"]["routing"]["resolveAgentRoute"],
+          },
+          session: {
+            readSessionUpdatedAt:
+              mockReadSessionUpdatedAt as unknown as PluginRuntime["channel"]["session"]["readSessionUpdatedAt"],
+            resolveStorePath:
+              mockResolveStorePath as unknown as PluginRuntime["channel"]["session"]["resolveStorePath"],
+          },
+          reply: {
+            resolveEnvelopeFormatOptions: vi.fn(
+              () => ({}),
+            ) as unknown as PluginRuntime["channel"]["reply"]["resolveEnvelopeFormatOptions"],
+            formatAgentEnvelope: vi.fn((params: { body: string }) => params.body),
+            finalizeInboundContext:
+              mockFinalizeInboundContext as unknown as PluginRuntime["channel"]["reply"]["finalizeInboundContext"],
+            dispatchReplyFromConfig: mockDispatchReplyFromConfig,
+            withReplyDispatcher:
+              mockWithReplyDispatcher as unknown as PluginRuntime["channel"]["reply"]["withReplyDispatcher"],
+          },
+          commands: {
+            shouldComputeCommandAuthorized: vi.fn(() => false),
+            resolveCommandAuthorizedFromAuthorizers: vi.fn(() => false),
+          },
+          media: {
+            saveMediaBuffer: vi.fn().mockResolvedValue({
+              id: "inbound-clip.mp4",
+              path: "/tmp/inbound-clip.mp4",
+              size: Buffer.byteLength("video"),
+              contentType: "video/mp4",
+            }),
+          },
+          pairing: {
+            readAllowFromStore: vi.fn().mockResolvedValue([]),
+            upsertPairingRequest: vi.fn().mockResolvedValue({ code: "ABCDEFGH", created: false }),
+            buildPairingReply: vi.fn(() => "Pairing response"),
+          },
+        },
+        media: {
+          detectMime: vi.fn(async () => "application/octet-stream"),
+        },
+      }),
+    );
+  });
+
+  it("prefers sender user_id over open_id when resolving display names", async () => {
+    const getUser = vi
+      .fn()
+      .mockResolvedValueOnce({ data: { user: { name: "同同" } } })
+      .mockResolvedValueOnce({ data: { user: { name: "用户377052" } } });
+    mockCreateFeishuClient.mockReturnValue({
+      contact: {
+        user: {
+          get: getUser,
+        },
+      },
+    });
+
+    const cfg: ClawdbotConfig = {
+      channels: {
+        feishu: {
+          appId: "cli_test",
+          appSecret: "secret",
+          dmPolicy: "open",
+        },
+      },
+    } as ClawdbotConfig;
+
+    const event: FeishuMessageEvent = {
+      sender: {
+        sender_id: {
+          open_id: "ou_sender_open",
+          user_id: "0b1a2c3d",
+        },
+      },
+      message: {
+        message_id: "msg-user-id-preferred",
+        chat_id: "oc-dm",
+        chat_type: "p2p",
+        message_type: "text",
+        content: JSON.stringify({ text: "你好" }),
+      },
+    };
+
+    await dispatchMessage({ cfg, event });
+
+    expect(getUser).toHaveBeenCalledWith({
+      path: { user_id: "0b1a2c3d" },
+      params: { user_id_type: "user_id" },
+    });
+    expect(getUser).toHaveBeenCalledTimes(1);
+    expect(mockFinalizeInboundContext).toHaveBeenCalledWith(
+      expect.objectContaining({
+        BodyForAgent: expect.stringContaining("同同: 你好"),
+      }),
+    );
+  });
+
+  it("falls back to sender open_id when user_id lookup returns no usable name", async () => {
+    const getUser = vi
+      .fn()
+      .mockResolvedValueOnce({ data: { user: { name: "" } } })
+      .mockResolvedValueOnce({ data: { user: { name: "同同" } } });
+    mockCreateFeishuClient.mockReturnValue({
+      contact: {
+        user: {
+          get: getUser,
+        },
+      },
+    });
+
+    const cfg: ClawdbotConfig = {
+      channels: {
+        feishu: {
+          appId: "cli_test",
+          appSecret: "secret",
+          dmPolicy: "open",
+        },
+      },
+    } as ClawdbotConfig;
+
+    const event: FeishuMessageEvent = {
+      sender: {
+        sender_id: {
+          open_id: "ou_sender_open_fallback",
+          user_id: "0b1a2c3d_fallback",
+        },
+      },
+      message: {
+        message_id: "msg-open-id-fallback",
+        chat_id: "oc-dm",
+        chat_type: "p2p",
+        message_type: "text",
+        content: JSON.stringify({ text: "你好" }),
+      },
+    };
+
+    await dispatchMessage({ cfg, event });
+
+    expect(getUser).toHaveBeenNthCalledWith(1, {
+      path: { user_id: "0b1a2c3d_fallback" },
+      params: { user_id_type: "user_id" },
+    });
+    expect(getUser).toHaveBeenNthCalledWith(2, {
+      path: { user_id: "ou_sender_open_fallback" },
+      params: { user_id_type: "open_id" },
+    });
+    expect(mockFinalizeInboundContext).toHaveBeenCalledWith(
+      expect.objectContaining({
+        BodyForAgent: expect.stringContaining("同同: 你好"),
+      }),
+    );
+  });
+});
+
 describe("handleFeishuMessage command authorization", () => {
   const mockFinalizeInboundContext = vi.fn((ctx: unknown) => ctx);
   const mockDispatchReplyFromConfig = vi

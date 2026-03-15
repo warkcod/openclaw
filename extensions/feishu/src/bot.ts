@@ -109,6 +109,11 @@ type SenderNameResult = {
   permissionError?: PermissionError;
 };
 
+type SenderLookupCandidate = {
+  id: string;
+  idType: "open_id" | "user_id" | "union_id";
+};
+
 function resolveSenderLookupIdType(senderId: string): "open_id" | "user_id" | "union_id" {
   const trimmed = senderId.trim();
   if (trimmed.startsWith("ou_")) {
@@ -122,38 +127,65 @@ function resolveSenderLookupIdType(senderId: string): "open_id" | "user_id" | "u
 
 async function resolveFeishuSenderName(params: {
   account: ResolvedFeishuAccount;
-  senderId: string;
+  senderOpenId?: string;
+  senderUserId?: string;
+  senderId?: string;
   log: (...args: any[]) => void;
 }): Promise<SenderNameResult> {
-  const { account, senderId, log } = params;
+  const { account, senderOpenId, senderUserId, senderId, log } = params;
   if (!account.configured) return {};
 
-  const normalizedSenderId = senderId.trim();
-  if (!normalizedSenderId) return {};
+  const lookupCandidates: SenderLookupCandidate[] = [];
+  const seen = new Set<string>();
+  const pushCandidate = (
+    rawId: string | undefined,
+    explicitType?: SenderLookupCandidate["idType"],
+  ) => {
+    const normalized = rawId?.trim();
+    if (!normalized || seen.has(normalized)) return;
+    seen.add(normalized);
+    lookupCandidates.push({
+      id: normalized,
+      idType: explicitType ?? resolveSenderLookupIdType(normalized),
+    });
+  };
 
-  const cached = senderNameCache.get(normalizedSenderId);
+  // Prefer user_id when available: for some tenants/groups, open_id lookups can degrade
+  // to anonymized placeholders while user_id resolves the real internal display name.
+  pushCandidate(senderUserId, "user_id");
+  pushCandidate(senderOpenId, "open_id");
+  pushCandidate(senderId);
+
+  if (lookupCandidates.length === 0) return {};
+
   const now = Date.now();
-  if (cached && cached.expireAt > now) return { name: cached.name };
+  for (const candidate of lookupCandidates) {
+    const cached = senderNameCache.get(candidate.id);
+    if (cached && cached.expireAt > now) {
+      return { name: cached.name };
+    }
+  }
 
   try {
     const client = createFeishuClient(account);
-    const userIdType = resolveSenderLookupIdType(normalizedSenderId);
 
-    // contact/v3/users/:user_id?user_id_type=<open_id|user_id|union_id>
-    const res: any = await client.contact.user.get({
-      path: { user_id: normalizedSenderId },
-      params: { user_id_type: userIdType },
-    });
+    for (const candidate of lookupCandidates) {
+      // contact/v3/users/:user_id?user_id_type=<open_id|user_id|union_id>
+      const res: any = await client.contact.user.get({
+        path: { user_id: candidate.id },
+        params: { user_id_type: candidate.idType },
+      });
 
-    const name: string | undefined =
-      res?.data?.user?.name ||
-      res?.data?.user?.display_name ||
-      res?.data?.user?.nickname ||
-      res?.data?.user?.en_name;
+      const name: string | undefined =
+        res?.data?.user?.name ||
+        res?.data?.user?.display_name ||
+        res?.data?.user?.nickname ||
+        res?.data?.user?.en_name;
 
-    if (name && typeof name === "string") {
-      senderNameCache.set(normalizedSenderId, { name, expireAt: now + SENDER_NAME_TTL_MS });
-      return { name };
+      if (name && typeof name === "string") {
+        senderNameCache.set(candidate.id, { name, expireAt: now + SENDER_NAME_TTL_MS });
+        return { name };
+      }
     }
 
     return {};
@@ -170,7 +202,10 @@ async function resolveFeishuSenderName(params: {
     }
 
     // Best-effort. Don't fail message handling if name lookup fails.
-    log(`feishu: failed to resolve sender name for ${normalizedSenderId}: ${String(err)}`);
+    const attempted = lookupCandidates
+      .map((candidate) => `${candidate.idType}:${candidate.id}`)
+      .join(", ");
+    log(`feishu: failed to resolve sender name for ${attempted}: ${String(err)}`);
     return {};
   }
 }
@@ -794,6 +829,7 @@ export function parseFeishuMessageEvent(
     // Keep the historical field name, but fall back to user_id when open_id is unavailable
     // (common in some mobile app deliveries).
     senderOpenId: senderFallbackId,
+    senderUserId,
     chatType: event.message.chat_type,
     mentionedBot,
     hasAnyMention,
@@ -944,7 +980,9 @@ export async function handleFeishuMessage(params: {
   if (feishuCfg?.resolveSenderNames ?? true) {
     const senderResult = await resolveFeishuSenderName({
       account,
-      senderId: ctx.senderOpenId,
+      senderOpenId: ctx.senderOpenId,
+      senderUserId: ctx.senderUserId,
+      senderId: ctx.senderId,
       log,
     });
     if (senderResult.name) ctx = { ...ctx, senderName: senderResult.name };
